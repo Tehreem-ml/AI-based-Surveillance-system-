@@ -1,194 +1,414 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
+#connect two cameras 
 
-# C extensions
-*.so
+import cv2
+import face_recognition
+import os
+import logging
+import datetime
+import numpy as np
+import pickle
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+# ==============================
+# Configuration and Setup
+# ==============================
 
-# PyInstaller
-#  Usually these files are written by a python script from a template
-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
-*.manifest
-*.spec
+# Paths for saving faces and encodings
+FACE_FOLDER = 'faces'
+ENCODINGS_FILE = 'encodings.pkl'
+MAPPING_FILE = 'face_id_mapping.pkl'
+LOG_FOLDER = 'logs'  # Folder to store individual log files for each face
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
+# Create necessary directories
+if not os.path.exists(FACE_FOLDER):
+    os.makedirs(FACE_FOLDER)
 
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
-.pytest_cache/
-cover/
+if not os.path.exists(LOG_FOLDER):
+    os.makedirs(LOG_FOLDER)
 
-# Translations
-*.mo
-*.pot
+# Create a face detector using Haar Cascade
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
+# Video capture sources
+MOBILE_CAMERA_URL = "http://10.11.104.63:8080//video"  # Replace with your mobile camera stream URL
+cap_laptop = cv2.VideoCapture(0)  # Laptop camera
+cap_mobile = cv2.VideoCapture(MOBILE_CAMERA_URL)
 
-# Flask stuff:
-instance/
-.webassets-cache
+# Initialize variables
+face_id = 0
+known_face_encodings = []
+face_id_mapping = {}  # Maps index in known_face_encodings to face_id
 
-# Scrapy stuff:
-.scrapy
 
-# Sphinx documentation
-docs/_build/
+# ==============================
+# Helper Functions
+# ==============================
 
-# PyBuilder
-.pybuilder/
-target/
+def load_known_faces():
+    global face_id, known_face_encodings, face_id_mapping
+    if os.path.exists(ENCODINGS_FILE) and os.path.exists(MAPPING_FILE):
+        # Load encodings and mappings from pickle files
+        with open(ENCODINGS_FILE, 'rb') as f:
+            known_face_encodings = pickle.load(f)
+        with open(MAPPING_FILE, 'rb') as f:
+            face_id_mapping = pickle.load(f)
+        if face_id_mapping:
+            face_id = max(face_id_mapping.values()) + 1
+        else:
+            face_id = 0
+    else:
+        # Load from face images
+        existing_faces = os.listdir(FACE_FOLDER)
+        for face_file in existing_faces:
+            if face_file.endswith(('.jpg', '.jpeg', '.png')):
+                try:
+                    # Extract face_id from filename: face_{id}_{camera}.jpg
+                    parts = face_file.split('_')
+                    current_id = int(parts[1])
 
-# Jupyter Notebook
-.ipynb_checkpoints
+                    # Load the image and compute encoding
+                    face_path = os.path.join(FACE_FOLDER, face_file)
+                    image = face_recognition.load_image_file(face_path)
+                    encodings = face_recognition.face_encodings(image)
 
-# IPython
-profile_default/
-ipython_config.py
+                    if encodings:
+                        known_face_encodings.append(encodings[0])
+                        face_id_mapping[len(known_face_encodings) - 1] = current_id
+                        face_id = max(face_id, current_id + 1)  # Ensure unique face_id
+                except Exception as e:
+                    print(f"Error processing {face_file}: {e}")
+        # Save encodings and mappings for future use
+        save_encodings()
 
-# pyenv
-#   For a library or package, you might want to ignore these files since the code is
-#   intended to run in multiple environments; otherwise, check them in:
-# .python-version
 
-# pipenv
-#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
-#   However, in case of collaboration, if having platform-specific dependencies or dependencies
-#   having no cross-platform support, pipenv may install dependencies that don't work, or not
-#   install all needed dependencies.
-#Pipfile.lock
+def save_encodings():
+    with open(ENCODINGS_FILE, 'wb') as f:
+        pickle.dump(known_face_encodings, f)
+    with open(MAPPING_FILE, 'wb') as f:
+        pickle.dump(face_id_mapping, f)
 
-# UV
-#   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#uv.lock
 
-# poetry
-#   Similar to Pipfile.lock, it is generally recommended to include poetry.lock in version control.
-#   This is especially recommended for binary packages to ensure reproducibility, and is more
-#   commonly ignored for libraries.
-#   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
-#poetry.lock
+def log_face_detection(face_id, message):
+    """Log detection details for a specific face."""
+    log_file = os.path.join(LOG_FOLDER, f'face_{face_id}.log')
+    with open(log_file, 'a') as log:
+        log.write(f'{datetime.datetime.now()} - {message}\n')
 
-# pdm
-#   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
-#pdm.lock
-#   pdm stores project-wide configurations in .pdm.toml, but it is recommended to not include it
-#   in version control.
-#   https://pdm.fming.dev/latest/usage/project/#working-with-version-control
-.pdm.toml
-.pdm-python
-.pdm-build/
 
-# PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
-__pypackages__/
+def process_frame(frame, camera_type):
+    global face_id
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    faces = face_cascade.detectMultiScale(frame, scaleFactor=1.1, minNeighbors=5)
 
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
+    for (x, y, w, h) in faces:
+        # Extract the face region
+        face = frame[y:y + h, x:x + w]
+        rgb_face = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
+        face_encodings = face_recognition.face_encodings(rgb_face)
 
-# SageMath parsed files
-*.sage.py
+        if face_encodings:
+            face_encoding = face_encodings[0]
+            # Compare with known faces
+            matches = face_recognition.compare_faces(known_face_encodings, face_encoding, tolerance=0.6)
+            face_distances = face_recognition.face_distance(known_face_encodings, face_encoding)
 
-# Environments
-.env
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
+            best_match_index = np.argmin(face_distances) if face_distances.size > 0 else None
+            if best_match_index is not None and matches[best_match_index]:
+                detected_face_id = face_id_mapping[best_match_index]
+                log_face_detection(detected_face_id, f'Detected again in {camera_type} camera.')
+                label = f'Face {detected_face_id}'
+            else:
+                # New face detected
+                face_path = os.path.join(FACE_FOLDER, f'face_{face_id}_{camera_type}.jpg')
+                cv2.imwrite(face_path, face)
+                log_face_detection(face_id, f'Unknown face detected and saved at {face_path} ({camera_type} camera).')
 
-# Spyder project settings
-.spyderproject
-.spyproject
+                # Add new encoding and update mappings
+                known_face_encodings.append(face_encoding)
+                face_id_mapping[len(known_face_encodings) - 1] = face_id
+                label = f'Face {face_id}'
 
-# Rope project settings
-.ropeproject
+                # Increment face_id for next new face and save updated encodings
+                face_id += 1
+                save_encodings()
 
-# mkdocs documentation
-/site
+            # Draw rectangle around the face
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            # Draw label below the face
+            cv2.putText(frame, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (36, 255, 12), 2)
+    return frame
 
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
 
-# Pyre type checker
-.pyre/
+# ==============================
+# Main Execution
+# ==============================
 
-# pytype static type analyzer
-.pytype/
+def main():
+    load_known_faces()
 
-# Cython debug symbols
-cython_debug/
+    while True:
+        # Read a frame from both cameras
+        ret_mobile, frame_mobile = cap_mobile.read()
+        ret_laptop, frame_laptop = cap_laptop.read()
 
-# PyCharm
-#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#  and can be added to the global gitignore or merged into this file.  For a more nuclear
-#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
-#.idea/
+        # Check if frames were captured successfully
+        if not ret_mobile:
+            print("Error: Could not retrieve frame from mobile camera.")
+            break
+        if not ret_laptop:
+            print("Error: Could not retrieve frame from laptop camera.")
+            break
 
-# Abstra
-# Abstra is an AI-powered process automation framework.
-# Ignore directories containing user credentials, local state, and settings.
-# Learn more at https://abstra.io/docs
-.abstra/
+        # Process frames
+        processed_mobile = process_frame(frame_mobile, 'mobile')
+        processed_laptop = process_frame(frame_laptop, 'laptop')
 
-# Visual Studio Code
-#  Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore 
-#  that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
-#  and can be added to the global gitignore or merged into this file. However, if you prefer, 
-#  you could uncomment the following to ignore the enitre vscode folder
-# .vscode/
+        # Resize frames to fit in a single window (optional)
+        frame_mobile_resized = cv2.resize(processed_mobile, (640, 480))
+        frame_laptop_resized = cv2.resize(processed_laptop, (640, 480))
 
-# Ruff stuff:
-.ruff_cache/
+        # Add camera labels to frames
+        cv2.putText(frame_mobile_resized, "Mobile Camera", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+        cv2.putText(frame_laptop_resized, "Laptop Camera", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
 
-# PyPI configuration file
-.pypirc
+        # Combine the two frames horizontally
+        combined_frame = np.hstack((frame_mobile_resized, frame_laptop_resized))
 
-# Cursor
-#  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
-#  exclude from AI features like autocomplete and code analysis. Recommended for sensitive data
-#  refer to https://docs.cursor.com/context/ignore-files
-.cursorignore
-.cursorindexingignore
+        # Display the combined frame in one window
+        cv2.imshow('Combined Camera View', combined_frame)
+
+        # Exit on pressing 'q'
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            print("Exit signal received. Closing program.")
+            break
+
+    # Release video capture objects and close windows
+    cap_mobile.release()
+    cap_laptop.release()
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+        cap_mobile.release()
+        cap_laptop.release()
+        cv2.destroyAllWindows()
+
+
+code 2 :-  conect four cameras
+import cv2
+import face_recognition
+import os
+import logging
+import datetime
+import numpy as np
+import pickle
+
+# ==============================
+# Configuration and Setup
+# ==============================
+
+# Set up logging
+logging.basicConfig(
+    filename='face_detection.log',
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+
+# Paths for saving faces and encodings
+FACE_FOLDER = 'faces'
+ENCODINGS_FILE = 'encodings.pkl'
+MAPPING_FILE = 'face_id_mapping.pkl'
+
+# Create the face folder if it doesn't exist
+if not os.path.exists(FACE_FOLDER):
+    os.makedirs(FACE_FOLDER)
+
+# Create a face detector using Haar Cascade
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+# Video capture sources
+MOBILE_CAMERA_URL = "http://10.11.149.115:8080/video"  # Replace with your mobile camera stream URL
+LAPTOP_CAMERA_INDEX = 0  # Default laptop camera
+THIRD_CAMERA_URL = "http://10.11.84:8080//video"  # Replace with your third camera stream URL
+FOURTH_CAMERA_URL = "http://10.11.49.117:8080//video"  # Replace with your fourth camera stream URL
+
+# Initialize video capture for all cameras
+cap_mobile = cv2.VideoCapture(MOBILE_CAMERA_URL)
+cap_laptop = cv2.VideoCapture(LAPTOP_CAMERA_INDEX)
+cap_third = cv2.VideoCapture(THIRD_CAMERA_URL)  # Third camera added
+cap_fourth = cv2.VideoCapture(FOURTH_CAMERA_URL)  # Fourth camera added
+
+# Initialize variables
+face_id = 0
+known_face_encodings = []
+face_id_mapping = {}  # Maps index in known_face_encodings to face_id
+
+
+# ==============================
+# Helper Functions
+# ==============================
+
+def load_known_faces():
+    global face_id, known_face_encodings, face_id_mapping
+    if os.path.exists(ENCODINGS_FILE) and os.path.exists(MAPPING_FILE):
+        # Load encodings and mappings from pickle files
+        with open(ENCODINGS_FILE, 'rb') as f:
+            known_face_encodings = pickle.load(f)
+        with open(MAPPING_FILE, 'rb') as f:
+            face_id_mapping = pickle.load(f)
+        if face_id_mapping:
+            face_id = max(face_id_mapping.values()) + 1
+        else:
+            face_id = 0
+        logging.info(f"Loaded {len(known_face_encodings)} known face encodings from files.")
+    else:
+        # Load from face images
+        existing_faces = os.listdir(FACE_FOLDER)
+        for face_file in existing_faces:
+            if face_file.endswith(('.jpg', '.jpeg', '.png')):
+                try:
+                    # Extract face_id from filename: face_{id}_{camera}.jpg
+                    parts = face_file.split('_')
+                    current_id = int(parts[1])
+
+                    # Load the image and compute encoding
+                    face_path = os.path.join(FACE_FOLDER, face_file)
+                    image = face_recognition.load_image_file(face_path)
+                    encodings = face_recognition.face_encodings(image)
+
+                    if encodings:
+                        known_face_encodings.append(encodings[0])
+                        face_id_mapping[len(known_face_encodings) - 1] = current_id
+                        face_id = max(face_id, current_id + 1)  # Ensure unique face_id
+                    else:
+                        logging.warning(f"No encoding found for {face_file}")
+                except Exception as e:
+                    logging.error(f"Error processing {face_file}: {e}")
+        # Save encodings and mappings for future use
+        save_encodings()
+
+        logging.info(f"Loaded {len(known_face_encodings)} known faces from images.")
+
+
+def save_encodings():
+    with open(ENCODINGS_FILE, 'wb') as f:
+        pickle.dump(known_face_encodings, f)
+    with open(MAPPING_FILE, 'wb') as f:
+        pickle.dump(face_id_mapping, f)
+    logging.info("Saved known face encodings and mappings to files.")
+
+
+def process_frame(frame, camera_type):
+    global face_id
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    faces = face_cascade.detectMultiScale(frame, scaleFactor=1.1, minNeighbors=5)
+
+    for (x, y, w, h) in faces:
+        # Extract the face region
+        face = frame[y:y + h, x:x + w]
+        rgb_face = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
+        face_encodings = face_recognition.face_encodings(rgb_face)
+
+        if face_encodings:
+            face_encoding = face_encodings[0]
+            # Compare with known faces
+            matches = face_recognition.compare_faces(known_face_encodings, face_encoding, tolerance=0.6)
+            face_distances = face_recognition.face_distance(known_face_encodings, face_encoding)
+
+            best_match_index = np.argmin(face_distances) if face_distances.size > 0 else None
+            if best_match_index is not None and matches[best_match_index]:
+                detected_face_id = face_id_mapping[best_match_index]
+                logging.info(f'Face ID {detected_face_id} detected again in {camera_type} camera.')
+                label = f'Face {detected_face_id}'
+            else:
+                # New face detected
+                face_path = os.path.join(FACE_FOLDER, f'face_{face_id}_{camera_type}.jpg')
+                cv2.imwrite(face_path, face)
+                logging.info(f'Unknown face detected and saved at {face_path} ({camera_type} camera).')
+
+                # Add new encoding and update mappings
+                known_face_encodings.append(face_encoding)
+                face_id_mapping[len(known_face_encodings) - 1] = face_id
+                label = f'Face {face_id}'
+                face_id += 1  # Increment face_id for next new face
+
+                # Save updated encodings and mappings
+                save_encodings()
+
+            # Draw rectangle around the face
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            # Draw label below the face
+            cv2.putText(frame, label, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.9, (36, 255, 12), 2)
+    return frame
+
+
+# ==============================
+# Main Execution
+# ==============================
+
+def main():
+    load_known_faces()
+
+    while True:
+        # Read frames from all four cameras
+        ret_mobile, frame_mobile = cap_mobile.read()
+        ret_laptop, frame_laptop = cap_laptop.read()
+        ret_third, frame_third = cap_third.read()
+        ret_fourth, frame_fourth = cap_fourth.read()
+
+        # Check if frames were captured successfully
+        if not ret_mobile:
+            logging.error("Error: Could not retrieve frame from mobile camera.")
+            break
+        if not ret_laptop:
+            logging.error("Error: Could not retrieve frame from laptop camera.")
+            break
+        if not ret_third:
+            logging.error("Error: Could not retrieve frame from third camera.")
+            break
+        if not ret_fourth:
+            logging.error("Error: Could not retrieve frame from fourth camera.")
+            break
+
+        # Process frames
+        processed_mobile = process_frame(frame_mobile, 'mobile')
+        processed_laptop = process_frame(frame_laptop, 'laptop')
+        processed_third = process_frame(frame_third, 'third')
+        processed_fourth = process_frame(frame_fourth, 'fourth')
+
+        # Display the resulting frames
+        cv2.imshow('Mobile Camera', processed_mobile)
+        cv2.imshow('Laptop Camera', processed_laptop)
+        cv2.imshow('Third Camera', processed_third)
+        cv2.imshow('Fourth Camera', processed_fourth)
+
+        # Exit on pressing 'q'
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            logging.info("Exit signal received. Closing program.")
+            break
+
+    # Release video capture objects and close windows
+    cap_mobile.release()
+    cap_laptop.release()
+    cap_third.release()  # Release third camera
+    cap_fourth.release()  # Release fourth camera
+    cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        logging.error(f"An unexpected error occurred: {e}")
+        cap_mobile.release()
+        cap_laptop.release()
+        cap_third.release()  # Ensure third camera is released
+        cap_fourth.release()  # Ensure fourth camera is released
+        cv2.destroyAllWindows()
+
+
